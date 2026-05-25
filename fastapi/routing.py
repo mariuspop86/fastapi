@@ -1,10 +1,12 @@
+import contextlib
 import dataclasses
 import email.message
 import functools
 import inspect
+import types
 import json
 import sys
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AbstractAsyncContextManager, AbstractContextManager, AsyncExitStack, asynccontextmanager
 from enum import Enum, IntEnum
 from typing import (
     Any,
@@ -14,6 +16,7 @@ from typing import (
     Collection,
     Coroutine,
     Dict,
+    Generator,
     List,
     Mapping,
     Optional,
@@ -21,6 +24,7 @@ from typing import (
     Set,
     Tuple,
     Type,
+    TypeVar,
     Union,
 )
 
@@ -198,6 +202,74 @@ def _prepare_response_content(
         assert not isinstance(res, type)
         return dataclasses.asdict(res)
     return res
+
+
+_T = TypeVar("_T")
+
+
+# Vendored from starlette.routing to avoid importing private symbols
+class _AsyncLiftContextManager(AbstractAsyncContextManager[_T]):
+    """
+    Wraps a synchronous context manager to make it async.
+
+    This is vendored from Starlette to avoid importing private symbols.
+    """
+
+    def __init__(self, cm: AbstractContextManager[_T]) -> None:
+        self._cm = cm
+
+    async def __aenter__(self) -> _T:
+        return self._cm.__enter__()
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_value: Optional[BaseException],
+        traceback: Optional[types.TracebackType],
+    ) -> Optional[bool]:
+        return self._cm.__exit__(exc_type, exc_value, traceback)
+
+
+# Vendored from starlette.routing to avoid importing private symbols
+def _wrap_gen_lifespan_context(
+    lifespan_context: Callable[[Any], Generator[Any, Any, Any]],
+) -> Callable[[Any], AbstractAsyncContextManager[Any]]:
+    """
+    Wrap a generator-based lifespan context into an async context manager.
+
+    This is vendored from Starlette to avoid importing private symbols.
+    """
+    cmgr = contextlib.contextmanager(lifespan_context)
+
+    @functools.wraps(cmgr)
+    def wrapper(app: Any) -> _AsyncLiftContextManager[Any]:
+        return _AsyncLiftContextManager(cmgr(app))
+
+    return wrapper
+
+
+class _DefaultLifespan:
+    """
+    Default lifespan context manager that runs on_startup and on_shutdown handlers.
+
+    This is a copy of the Starlette _DefaultLifespan class that was removed
+    in Starlette 1.0. FastAPI keeps it to maintain backward compatibility with
+    on_startup and on_shutdown event handlers.
+
+    Ref: https://github.com/Kludex/starlette/pull/3117
+    """
+
+    def __init__(self, router: "APIRouter") -> None:
+        self._router = router
+
+    async def __aenter__(self) -> None:
+        await self._router._startup()
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self._router._shutdown()
+
+    def __call__(self: _T, app: object) -> _T:
+        return self
 
 
 def _merge_lifespan_context(
@@ -913,13 +985,31 @@ class APIRouter(routing.Router):
             ),
         ] = Default(generate_unique_id),
     ) -> None:
+        # Determine the lifespan context to use
+        if lifespan is None:
+            # Use the default lifespan that runs on_startup/on_shutdown handlers
+            lifespan_context: Lifespan[Any] = _DefaultLifespan(self)
+        elif inspect.isasyncgenfunction(lifespan):
+            lifespan_context = asynccontextmanager(lifespan)
+        elif inspect.isgeneratorfunction(lifespan):
+            lifespan_context = _wrap_gen_lifespan_context(lifespan)
+        else:
+            lifespan_context = lifespan
+        self.lifespan_context = lifespan_context
+
         super().__init__(
             routes=routes,
             redirect_slashes=redirect_slashes,
             default=default,
-            on_startup=on_startup,
-            on_shutdown=on_shutdown,
-            lifespan=lifespan,
+            lifespan=lifespan_context,
+        )
+        # Handle on_startup/on_shutdown locally since Starlette removed support
+        # Ref: https://github.com/Kludex/starlette/pull/3117
+        self.on_startup: List[Callable[[], Any]] = (
+            [] if on_startup is None else list(on_startup)
+        )
+        self.on_shutdown: List[Callable[[], Any]] = (
+            [] if on_shutdown is None else list(on_shutdown)
         )
         if prefix:
             assert prefix.startswith("/"), "A path prefix must start with '/'"
